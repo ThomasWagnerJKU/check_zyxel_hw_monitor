@@ -1,0 +1,322 @@
+#!/bin/bash
+# Nagios plugin to check switch time against NTP or local machine time.
+
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+
+# Zyxel system current date/time (DisplayString, obsolete but commonly implemented)
+OID_SWITCH_TIME_ZYXEL=".1.3.6.1.4.1.890.1.15.3.1.17.0"
+# Standard host-resources wall clock time (DateAndTime)
+OID_SWITCH_TIME_HR=".1.3.6.1.2.1.25.1.2.0"
+OID_ENGINE_TIME=".1.3.6.1.6.3.10.2.1.3.0"
+OID_ENGINE_BOOTS=".1.3.6.1.6.3.10.2.1.2.0"
+
+HOSTADDRESS=""
+NTP_SERVER=""
+WARN_LVL="5"
+CRIT_LVL="30"
+COMMUNITY="public"
+SNMP_VERSION="2c"
+SNMP_PORT="161"
+SNMP_TIMEOUT="2"
+SNMP_RETRIES="1"
+V3_USER=""
+V3_LEVEL=""
+V3_AUTH_PROTO="SHA"
+V3_AUTH_PASS=""
+V3_PRIV_PROTO="AES"
+V3_PRIV_PASS=""
+
+usage() {
+   cat <<EOF
+Usage: $0 -H <host> [-N <ntp_server>] [-w <warn_seconds>] [-c <crit_seconds>] [-C <community>] [-V 2c|3] [-p <port>]
+        [-u <v3_user>] [-l noAuthNoPriv|authNoPriv|authPriv] [-a MD5|SHA] [-A <auth_pass>]
+        [-x DES|AES] [-X <priv_pass>] [-t <timeout>] [-r <retries>]
+EOF
+}
+
+is_int() {
+   [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_number() {
+   [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+first_int_from_text() {
+   echo "$1" | grep -oE '[0-9]+' | head -n1
+}
+
+parse_switch_time_to_epoch() {
+   local raw="$1"
+   local normalized=""
+
+   normalized="$(echo "$raw" | tr ',' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+
+   if epoch=$(date -d "$normalized" +%s 2>/dev/null); then
+      echo "$epoch"
+      return 0
+   fi
+
+   normalized="${normalized//\//-}"
+   if epoch=$(date -d "$normalized" +%s 2>/dev/null); then
+      echo "$epoch"
+      return 0
+   fi
+
+   return 1
+}
+
+parse_hr_dateandtime_to_epoch() {
+   local raw="$1"
+   local bytes=()
+   local count=0
+   local year month day hour minute second deci sign tzh tzm
+
+   raw="$(echo "$raw" | tr -d '"')"
+   # Keep only hex byte pairs and normalize whitespace.
+   raw="$(echo "$raw" | tr '[:lower:]' '[:upper:]' | sed -E 's/[^0-9A-F ]/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//')"
+   read -r -a bytes <<< "$raw"
+   count="${#bytes[@]}"
+
+   if (( count < 8 )); then
+      return 1
+   fi
+
+   year=$((16#${bytes[0]} * 256 + 16#${bytes[1]}))
+   month=$((16#${bytes[2]}))
+   day=$((16#${bytes[3]}))
+   hour=$((16#${bytes[4]}))
+   minute=$((16#${bytes[5]}))
+   second=$((16#${bytes[6]}))
+   deci=$((16#${bytes[7]}))
+
+   if (( count >= 11 )); then
+      sign="${bytes[8]}"
+      tzh=$((16#${bytes[9]}))
+      tzm=$((16#${bytes[10]}))
+      if [[ "$sign" == "2B" || "$sign" == "2D" ]]; then
+         local sign_chr="+"
+         if [[ "$sign" == "2D" ]]; then
+            sign_chr="-"
+         fi
+         date -d "$(printf '%04d-%02d-%02d %02d:%02d:%02d %s%02d%02d' "$year" "$month" "$day" "$hour" "$minute" "$second" "$sign_chr" "$tzh" "$tzm")" +%s 2>/dev/null && return 0
+      fi
+   fi
+
+   # Fall back to local timezone when timezone bytes are missing or invalid.
+   date -d "$(printf '%04d-%02d-%02d %02d:%02d:%02d.%01d' "$year" "$month" "$day" "$hour" "$minute" "$second" "$deci")" +%s 2>/dev/null
+}
+
+get_ntp_offset() {
+   local out=""
+   local offset=""
+
+   if command -v ntpdate >/dev/null 2>&1; then
+      out="$(ntpdate -q "$NTP_SERVER" 2>/dev/null)" || return 1
+      offset="$(echo "$out" | awk -F'offset ' '/offset/ {split($2,a,", "); print a[1]; exit}')"
+   elif command -v sntp >/dev/null 2>&1; then
+      out="$(sntp "$NTP_SERVER" 2>/dev/null)" || return 1
+      offset="$(echo "$out" | awk '/offset/ {for (i=1; i<=NF; i++) {if ($i ~ /offset/) {gsub(/[^0-9.+-]/, "", $(i+1)); print $(i+1); exit}}}')"
+   elif command -v python3 >/dev/null 2>&1; then
+      offset="$(python3 - "$NTP_SERVER" <<'PY'
+import socket
+import struct
+import sys
+import time
+
+host = sys.argv[1]
+NTP_DELTA = 2208988800
+
+msg = b'\x1b' + 47 * b'\0'
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+t0 = time.time()
+s.sendto(msg, (host, 123))
+data, _ = s.recvfrom(48)
+t3 = time.time()
+
+if len(data) < 48:
+    raise SystemExit(1)
+
+t1_sec, t1_frac = struct.unpack('!II', data[32:40])
+t2_sec, t2_frac = struct.unpack('!II', data[40:48])
+t1 = (t1_sec - NTP_DELTA) + (t1_frac / 2**32)
+t2 = (t2_sec - NTP_DELTA) + (t2_frac / 2**32)
+
+offset = ((t1 - t0) + (t2 - t3)) / 2.0
+print(f"{offset:.6f}")
+PY
+)" || return 1
+   else
+      return 2
+   fi
+
+   if ! is_number "$offset"; then
+      return 1
+   fi
+
+   echo "$offset"
+   return 0
+}
+
+while getopts "hH:N:w:c:C:V:p:u:l:a:A:x:X:t:r:" OPTION; do
+   case "$OPTION" in
+      h) usage; exit "$STATE_UNKNOWN" ;;
+      H) HOSTADDRESS="$OPTARG" ;;
+      N) NTP_SERVER="$OPTARG" ;;
+      w) WARN_LVL="$OPTARG" ;;
+      c) CRIT_LVL="$OPTARG" ;;
+      C) COMMUNITY="$OPTARG" ;;
+      V) SNMP_VERSION="$OPTARG" ;;
+      p) SNMP_PORT="$OPTARG" ;;
+      u) V3_USER="$OPTARG" ;;
+      l) V3_LEVEL="$OPTARG" ;;
+      a) V3_AUTH_PROTO="$OPTARG" ;;
+      A) V3_AUTH_PASS="$OPTARG" ;;
+      x) V3_PRIV_PROTO="$OPTARG" ;;
+      X) V3_PRIV_PASS="$OPTARG" ;;
+      t) SNMP_TIMEOUT="$OPTARG" ;;
+      r) SNMP_RETRIES="$OPTARG" ;;
+      *) usage; exit "$STATE_UNKNOWN" ;;
+   esac
+done
+
+if [[ -z "$HOSTADDRESS" ]]; then
+   echo "UNKNOWN - missing host (-H)"
+   exit "$STATE_UNKNOWN"
+fi
+
+if ! is_int "$WARN_LVL" || ! is_int "$CRIT_LVL"; then
+   echo "UNKNOWN - thresholds must be integers (seconds)"
+   exit "$STATE_UNKNOWN"
+fi
+
+if (( WARN_LVL >= CRIT_LVL )); then
+   echo "UNKNOWN - warning must be lower than critical"
+   exit "$STATE_UNKNOWN"
+fi
+
+if ! command -v snmpget >/dev/null 2>&1; then
+   echo "UNKNOWN - snmpget not found"
+   exit "$STATE_UNKNOWN"
+fi
+
+if [[ "$SNMP_VERSION" == "3" ]]; then
+   if [[ -z "$V3_USER" || -z "$V3_LEVEL" ]]; then
+      echo "UNKNOWN - SNMPv3 requires -u <user> and -l <security level>"
+      exit "$STATE_UNKNOWN"
+   fi
+   SNMP_ARGS=(-v3 -u "$V3_USER" -l "$V3_LEVEL" -Oqv -t "$SNMP_TIMEOUT" -r "$SNMP_RETRIES" "$HOSTADDRESS:$SNMP_PORT")
+   if [[ "$V3_LEVEL" == "authNoPriv" || "$V3_LEVEL" == "authPriv" ]]; then
+      SNMP_ARGS+=(-a "$V3_AUTH_PROTO" -A "$V3_AUTH_PASS")
+   fi
+   if [[ "$V3_LEVEL" == "authPriv" ]]; then
+      SNMP_ARGS+=(-x "$V3_PRIV_PROTO" -X "$V3_PRIV_PASS")
+   fi
+else
+   SNMP_ARGS=(-v2c -c "$COMMUNITY" -Oqv -t "$SNMP_TIMEOUT" -r "$SNMP_RETRIES" "$HOSTADDRESS:$SNMP_PORT")
+fi
+
+SWITCH_TIME_RAW="$(snmpget "${SNMP_ARGS[@]}" "$OID_SWITCH_TIME_ZYXEL" 2>/dev/null)"
+SWITCH_TIME_RAW="${SWITCH_TIME_RAW//\"/}"
+
+SWITCH_EPOCH=""
+SWITCH_SOURCE=""
+
+if [[ -n "$SWITCH_TIME_RAW" && "$SWITCH_TIME_RAW" != *"No Such Object"* && "$SWITCH_TIME_RAW" != *"No Such Instance"* ]]; then
+   SWITCH_EPOCH="$(parse_switch_time_to_epoch "$SWITCH_TIME_RAW")"
+   if is_int "$SWITCH_EPOCH"; then
+      SWITCH_SOURCE="zyxel"
+   fi
+fi
+
+if [[ -z "$SWITCH_SOURCE" ]]; then
+   SWITCH_TIME_RAW_HR="$(snmpget "${SNMP_ARGS[@]}" "$OID_SWITCH_TIME_HR" 2>/dev/null)"
+   SWITCH_TIME_RAW_HR="${SWITCH_TIME_RAW_HR//\"/}"
+   if [[ -n "$SWITCH_TIME_RAW_HR" && "$SWITCH_TIME_RAW_HR" != *"No Such Object"* && "$SWITCH_TIME_RAW_HR" != *"No Such Instance"* ]]; then
+      SWITCH_EPOCH="$(parse_hr_dateandtime_to_epoch "$SWITCH_TIME_RAW_HR")"
+      if is_int "$SWITCH_EPOCH"; then
+         SWITCH_TIME_RAW="$SWITCH_TIME_RAW_HR"
+         SWITCH_SOURCE="hrSystemDate"
+      fi
+   fi
+fi
+
+LOCAL_EPOCH="$(date +%s)"
+REF_LABEL="local"
+REF_EPOCH="$LOCAL_EPOCH"
+
+if [[ -n "$NTP_SERVER" ]]; then
+   NTP_OFFSET="$(get_ntp_offset)"
+   NTP_RC=$?
+   if (( NTP_RC == 2 )); then
+      echo "UNKNOWN - no NTP query tool available (need ntpdate, sntp, or python3)"
+      exit "$STATE_UNKNOWN"
+   fi
+   if (( NTP_RC != 0 )); then
+      echo "UNKNOWN - unable to query NTP server ${NTP_SERVER}"
+      exit "$STATE_UNKNOWN"
+   fi
+   REF_EPOCH="$(awk -v l="$LOCAL_EPOCH" -v o="$NTP_OFFSET" 'BEGIN { printf "%.0f", l + o }')"
+   REF_LABEL="ntp:${NTP_SERVER}"
+fi
+
+if [[ -z "$SWITCH_SOURCE" ]]; then
+   ENGINE_TIME_RAW="$(snmpget "${SNMP_ARGS[@]}" "$OID_ENGINE_TIME" 2>/dev/null)"
+   ENGINE_BOOTS_RAW="$(snmpget "${SNMP_ARGS[@]}" "$OID_ENGINE_BOOTS" 2>/dev/null)"
+   ENGINE_TIME="$(first_int_from_text "$ENGINE_TIME_RAW")"
+   ENGINE_BOOTS="$(first_int_from_text "$ENGINE_BOOTS_RAW")"
+
+   if ! is_int "$ENGINE_TIME" || ! is_int "$ENGINE_BOOTS"; then
+      echo "UNKNOWN - switch does not expose readable current-time OIDs (.1.3.6.1.4.1.890.1.15.3.1.17.0 or .1.3.6.1.2.1.25.1.2.0)"
+      exit "$STATE_UNKNOWN"
+   fi
+
+   STATE_FILE="/tmp/check_zyxel-time-${HOSTADDRESS}.state"
+   BASELINE_BOOT_EPOCH=""
+   BASELINE_BOOTS=""
+
+   if [[ -r "$STATE_FILE" ]]; then
+      # shellcheck disable=SC1090
+      . "$STATE_FILE"
+   fi
+
+   if [[ -z "$BASELINE_BOOT_EPOCH" || -z "$BASELINE_BOOTS" || "$BASELINE_BOOTS" != "$ENGINE_BOOTS" ]]; then
+      BASELINE_BOOT_EPOCH="$((REF_EPOCH - ENGINE_TIME))"
+      {
+         echo "BASELINE_BOOT_EPOCH=${BASELINE_BOOT_EPOCH}"
+         echo "BASELINE_BOOTS=${ENGINE_BOOTS}"
+      } > "$STATE_FILE"
+      echo "UNKNOWN - initialized engine-time baseline from ${REF_LABEL}; run check again for drift monitoring"
+      exit "$STATE_UNKNOWN"
+   fi
+
+   SWITCH_EPOCH="$((BASELINE_BOOT_EPOCH + ENGINE_TIME))"
+   SWITCH_SOURCE="snmpEngineTime"
+fi
+
+DIFF_SEC="$(awk -v s="$SWITCH_EPOCH" -v n="$REF_EPOCH" 'BEGIN { d=s-n; if (d<0) d=-d; printf "%.0f", d }')"
+
+if ! is_int "$DIFF_SEC"; then
+   echo "UNKNOWN - failed to calculate time difference"
+   exit "$STATE_UNKNOWN"
+fi
+
+SWITCH_FMT="$(date -d "@${SWITCH_EPOCH}" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null)"
+REF_FMT="$(date -d "@${REF_EPOCH}" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null)"
+
+if (( DIFF_SEC >= CRIT_LVL )); then
+   echo "CRITICAL - time skew ${DIFF_SEC}s (switch_source=${SWITCH_SOURCE} switch='${SWITCH_FMT}' reference='${REF_FMT}' ref_source='${REF_LABEL}') | time_skew=${DIFF_SEC}s;${WARN_LVL};${CRIT_LVL};0;"
+   exit "$STATE_CRITICAL"
+fi
+
+if (( DIFF_SEC >= WARN_LVL )); then
+   echo "WARNING - time skew ${DIFF_SEC}s (switch_source=${SWITCH_SOURCE} switch='${SWITCH_FMT}' reference='${REF_FMT}' ref_source='${REF_LABEL}') | time_skew=${DIFF_SEC}s;${WARN_LVL};${CRIT_LVL};0;"
+   exit "$STATE_WARNING"
+fi
+
+echo "OK - time skew ${DIFF_SEC}s (switch_source=${SWITCH_SOURCE} switch='${SWITCH_FMT}' reference='${REF_FMT}' ref_source='${REF_LABEL}') | time_skew=${DIFF_SEC}s;${WARN_LVL};${CRIT_LVL};0;"
+exit "$STATE_OK"
