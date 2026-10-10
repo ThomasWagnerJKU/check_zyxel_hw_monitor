@@ -1,0 +1,38 @@
+# bash completion for check_zyxel-{cpu,mem}                  -*- shell-script -*-
+
+_check_zyxel_cpu()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    COMPREPLY=()
+
+    case $prev in
+        -H)
+            mapfile -t COMPREPLY < <(compgen -A hostname -- "$cur")
+            return
+            ;;
+        -V)
+            mapfile -t COMPREPLY < <(compgen -W '2c 3' -- "$cur")
+            return
+            ;;
+        -l)
+            mapfile -t COMPREPLY < <(compgen -W 'noAuthNoPriv authNoPriv authPriv' -- "$cur")
+            return
+            ;;
+        -a)
+            mapfile -t COMPREPLY < <(compgen -W 'MD5 SHA' -- "$cur")
+            return
+            ;;
+        -x)
+            mapfile -t COMPREPLY < <(compgen -W 'DES AES' -- "$cur")
+            return
+            ;;
+        -w | -c | -C | -p | -u | -A | -X | -t | -r)
+            return
+            ;;
+    esac
+
+    # no positional arguments: offer the options
+    mapfile -t COMPREPLY < <(compgen -W '-h -H -w -c -C -V -p -u -l -a -A -x -X -t -r' -- "$cur")
+}
+# check_zyxel-mem takes the same options
+complete -F _check_zyxel_cpu check_zyxel-cpu check_zyxel-mem

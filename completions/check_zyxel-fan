@@ -1,0 +1,38 @@
+# bash completion for check_zyxel-{fan,temperature,voltage}  -*- shell-script -*-
+
+_check_zyxel_fan()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    COMPREPLY=()
+
+    case $prev in
+        -H)
+            mapfile -t COMPREPLY < <(compgen -A hostname -- "$cur")
+            return
+            ;;
+        -V)
+            mapfile -t COMPREPLY < <(compgen -W '2c 3' -- "$cur")
+            return
+            ;;
+        -l)
+            mapfile -t COMPREPLY < <(compgen -W 'noAuthNoPriv authNoPriv authPriv' -- "$cur")
+            return
+            ;;
+        -a)
+            mapfile -t COMPREPLY < <(compgen -W 'MD5 SHA' -- "$cur")
+            return
+            ;;
+        -x)
+            mapfile -t COMPREPLY < <(compgen -W 'DES AES' -- "$cur")
+            return
+            ;;
+        -i | -w | -c | -C | -p | -u | -A | -X | -t | -r)
+            return
+            ;;
+    esac
+
+    # no positional arguments: offer the options
+    mapfile -t COMPREPLY < <(compgen -W '-h -H -i -w -c -C -V -p -u -l -a -A -x -X -t -r' -- "$cur")
+}
+# check_zyxel-temperature, check_zyxel-voltage take the same options
+complete -F _check_zyxel_fan check_zyxel-fan check_zyxel-temperature check_zyxel-voltage

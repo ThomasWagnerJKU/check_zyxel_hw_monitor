@@ -48,3 +48,27 @@ Use `-V 3` and pass user/security credentials:
 - `check_zyxel-time` requires one of: `ntpdate`, `sntp`, or `python3` to query the given NTP server.
 - If `-N` is omitted for `check_zyxel-time`, the script compares switch time against local machine time.
 - `check_zyxel-flash` uses `.1.3.6.1.4.1.890.1.15.3.2.6.0` by default; some models do not implement this OID. Use `-o` to provide a model-specific flash usage OID.
+
+## Bash completion
+
+The files in `completions/` complete the options and their fixed values (SNMP
+version, security level and protocols), also when the plugins are called by
+their full path. Plugins with the same options share a file:
+`check_zyxel-cpu` serves `check_zyxel-mem` too, and `check_zyxel-fan` serves
+`check_zyxel-temperature` and `check_zyxel-voltage`. bash-completion looks up
+the file by the command name, so these need links. The packages install them;
+otherwise copy them to bash-completion's directory:
+
+```bash
+install -D -m 0644 -t /usr/share/bash-completion/completions completions/check_zyxel-*
+cd /usr/share/bash-completion/completions
+ln -s check_zyxel-cpu check_zyxel-mem
+ln -s check_zyxel-fan check_zyxel-temperature
+ln -s check_zyxel-fan check_zyxel-voltage
+```
+
+## Tests
+
+```bash
+python3 -m unittest -v
+```
